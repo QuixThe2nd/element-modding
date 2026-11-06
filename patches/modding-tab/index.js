@@ -96,6 +96,11 @@ Restart" button that reloads the webapp.
         version.style.cssText = "font-size:12px;color:var(--cpd-color-text-secondary,inherit);";
         const title = el("div");
         title.appendChild(name);
+        if (p.author) {
+            const author = el("span", null, ` by ${p.author}`);
+            author.style.cssText = "font-size:12px;color:var(--cpd-color-text-secondary,inherit);";
+            title.appendChild(author);
+        }
         title.appendChild(version);
         const desc = el("div", null, p.description || "");
         desc.style.cssText = "font-size:12px;color:var(--cpd-color-text-secondary,inherit);margin-top:2px;";
