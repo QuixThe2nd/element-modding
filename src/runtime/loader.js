@@ -9,7 +9,9 @@ default: the loader starts a patch only if it is marked "required" in the
 manifest (e.g. the Modding tab itself), or if its id is in the persisted
 enabled set (localStorage key "element-mods.enabled"). setPatchEnabled() toggles
 a patch live (start/stop) and persists the change; reload() reloads the webapp
-so the whole set is re-applied from scratch.
+so the whole set is re-applied from scratch. A global pause (localStorage key
+"element-mods.paused") stops every non-required patch while keeping required
+ones (like the Modding tab) alive so the UI can always recover.
 
 The loader also hosts a shared "settings tabs" coordinator (window.mods.settingsTabs)
 so multiple patches can each contribute a tab to the Settings dialog without
@@ -20,6 +22,7 @@ fighting over the TabbedView.
 
     const LOG_PREFIX = "[element-mods]";
     const ENABLED_KEY = "element-mods.enabled";
+    const PAUSED_KEY = "element-mods.paused";
 
     const registry = new Map(); // id -> { start, stop, started }
     let manifest = null;
@@ -44,7 +47,24 @@ fighting over the TabbedView.
         }
     }
 
+    function readPaused() {
+        try {
+            return JSON.parse(localStorage.getItem(PAUSED_KEY) || "false") === true;
+        } catch {
+            return false;
+        }
+    }
+
+    function writePaused(value) {
+        try {
+            localStorage.setItem(PAUSED_KEY, JSON.stringify(value === true));
+        } catch (err) {
+            console.error(LOG_PREFIX, "failed to persist paused state", err);
+        }
+    }
+
     const enabled = readEnabled();
+    let paused = readPaused();
 
     function isRequired(id) {
         if (!manifest || !Array.isArray(manifest.patches)) return false;
@@ -211,6 +231,27 @@ fighting over the TabbedView.
             return isRequired(id) || enabled.has(id);
         },
 
+        isPaused() {
+            return paused;
+        },
+
+        // Global pause: true stops every started non-required patch (required
+        // patches stay alive so the UI can recover); false restarts exactly
+        // the persisted enabled set. The flag itself is persisted.
+        setPaused(value) {
+            paused = value === true;
+            writePaused(paused);
+            if (paused) {
+                for (const [id, def] of registry) {
+                    if (def.started && !isRequired(id)) stopPatch(id);
+                }
+            } else {
+                for (const id of enabled) {
+                    if (registry.has(id) && !isRequired(id)) startPatch(id);
+                }
+            }
+        },
+
         // Toggle a patch live and persist. Returns false if the patch is unknown
         // or required (required patches are always enabled).
         setPatchEnabled(id, value) {
@@ -218,7 +259,9 @@ fighting over the TabbedView.
             if (isRequired(id)) return false;
             if (value) {
                 enabled.add(id);
-                startPatch(id);
+                // While paused the enabled set is the source of truth; the
+                // patch is started on unpause (or next boot), not now.
+                if (!paused) startPatch(id);
             } else {
                 enabled.delete(id);
                 stopPatch(id);
@@ -283,7 +326,9 @@ fighting over the TabbedView.
         }
 
         for (const entry of entries) {
-            if (isRequired(entry.id) || enabled.has(entry.id)) startPatch(entry.id);
+            // While paused only required patches run; the enabled set is
+            // restored by setPaused(false).
+            if (isRequired(entry.id) || (!paused && enabled.has(entry.id))) startPatch(entry.id);
         }
     }
 

@@ -46,7 +46,7 @@ Restart" button that reloads the webapp.
         return li;
     }
 
-    function createSwitch(checked, onChange) {
+    function createSwitch(checked, onChange, disabled) {
         const wrap = el("span");
         wrap.style.cssText =
             "position:relative;display:inline-block;width:38px;height:22px;flex:0 0 auto;cursor:pointer;";
@@ -72,6 +72,12 @@ Restart" button that reloads the webapp.
         }
         paint();
 
+        if (disabled) {
+            input.disabled = true;
+            wrap.style.opacity = "0.5";
+            wrap.style.cursor = "default";
+        }
+
         input.addEventListener("change", () => {
             paint();
             if (onChange) onChange(input.checked);
@@ -83,7 +89,7 @@ Restart" button that reloads the webapp.
         return wrap;
     }
 
-    function patchRow(p, enabled, toggleable) {
+    function patchRow(p, enabled, toggleable, disabled) {
         const item = el("div");
         item.style.cssText =
             "display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 12px;" +
@@ -106,10 +112,14 @@ Restart" button that reloads the webapp.
 
         if (toggleable) {
             item.appendChild(
-                createSwitch(enabled, (checked) => {
-                    window.mods.setPatchEnabled(p.id, checked);
-                    refreshPanel();
-                }),
+                createSwitch(
+                    enabled,
+                    (checked) => {
+                        window.mods.setPatchEnabled(p.id, checked);
+                        refreshPanel();
+                    },
+                    disabled,
+                ),
             );
         } else {
             const badge = el("span", null, "Always enabled");
@@ -137,6 +147,29 @@ Restart" button that reloads the webapp.
         version.style.cssText = "color:var(--cpd-color-text-secondary,inherit);margin-bottom:16px;";
         content.appendChild(version);
 
+        // Master pause toggle: stops every non-required patch while keeping
+        // this tab (required) alive so the user can always unpause.
+        const paused = window.mods.isPaused();
+        const pauseRow = el("div");
+        pauseRow.style.cssText =
+            "display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 12px;" +
+            "background:var(--cpd-color-bg-subtle-secondary,transparent);border-radius:8px;";
+        const pauseLeft = el("div");
+        const pauseLabel = el("span", null, "Pause all mods");
+        pauseLabel.style.cssText = "font-weight:600;";
+        const pauseHint = el("div", null, "Stops every patch except this tab. Per-patch switches are remembered.");
+        pauseHint.style.cssText = "font-size:12px;color:var(--cpd-color-text-secondary,inherit);margin-top:2px;";
+        pauseLeft.appendChild(pauseLabel);
+        pauseLeft.appendChild(pauseHint);
+        pauseRow.appendChild(pauseLeft);
+        pauseRow.appendChild(
+            createSwitch(paused, (checked) => {
+                window.mods.setPaused(checked);
+                refreshPanel();
+            }),
+        );
+        content.appendChild(pauseRow);
+
         const divider = el("hr");
         divider.style.cssText = "border:none;border-top:1px solid var(--cpd-color-border-disabled,#e0e0e0);margin:16px 0;";
         content.appendChild(divider);
@@ -153,23 +186,39 @@ Restart" button that reloads the webapp.
             for (const p of patches) {
                 const toggleable = !p.required;
                 const enabled = toggleable ? window.mods.isPatchEnabled(p.id) : true;
-                list.appendChild(patchRow(p, enabled, toggleable));
+                const row = patchRow(p, enabled, toggleable, paused);
+                if (paused && toggleable) {
+                    row.style.opacity = "0.5";
+                }
+                list.appendChild(row);
             }
             content.appendChild(list);
         }
 
-        const applyBtn = el("button", null, "Apply & Restart");
+        let applyBtn;
+        if (paused) {
+            applyBtn = el("button", null, "Restart with mods");
+            applyBtn.addEventListener("click", () => {
+                window.mods.setPaused(false);
+                window.mods.reload();
+            });
+        } else {
+            applyBtn = el("button", null, "Apply & Restart");
+            applyBtn.addEventListener("click", () => {
+                window.mods.reload();
+            });
+        }
         applyBtn.type = "button";
         applyBtn.style.cssText =
             "margin-top:20px;padding:8px 16px;border:none;border-radius:8px;" +
             "background:var(--cpd-color-bg-action-primary,#0dbd8b);color:#fff;" +
             "font:var(--cpd-font-body-md-semibold,600 15px/1.5 sans-serif);cursor:pointer;";
-        applyBtn.addEventListener("click", () => {
-            window.mods.reload();
-        });
         content.appendChild(applyBtn);
 
-        const hint = el("div", null, "Toggles apply instantly and are saved. Restart reloads Element with the current set.");
+        const hintText = paused
+            ? "Paused: no patches except this tab are running. Restart unpauses and reloads with your saved set."
+            : "Toggles apply instantly and are saved. Restart reloads Element with the current set.";
+        const hint = el("div", null, hintText);
         hint.style.cssText = "margin-top:8px;font-size:12px;color:var(--cpd-color-text-secondary,inherit);";
         content.appendChild(hint);
 
