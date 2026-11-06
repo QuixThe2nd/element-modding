@@ -26,8 +26,11 @@ How it works:
     Element's chips only filter in flat mode, and with sections enabled
     low-priority rooms sit inside Rooms/People, so room tiles themselves are
     collapsed with a marker class (1px height, never display:none —
-    react-virtuoso warns on zero-height), re-applied by a MutationObserver
-    plus a periodic timer (same technique as the Hide Room patch). Tiles are
+    react-virtuoso warns on zero-height), re-applied by a scan that runs
+    pre-paint (requestAnimationFrame-coalesced, so tiles never flash
+    visible) triggered by a MutationObserver, a Room.tags client listener,
+    the Settings toggles (synchronously), and a periodic timer (same
+    technique as the Hide Room patch). Tiles are
     mapped to rooms by room id from the tile's React fiber when available,
     falling back to a name->tags mapping.
   - The "favourite" chip only appears while sections are disabled (Latest
@@ -83,7 +86,7 @@ How it works:
     let registered = false;
     let listObservers = [];
     let refreshTimer = null;
-    let scanTimer = null;
+    let rafHandle = null;
     let migrated = false;
 
     // -- low-priority room hiding -----------------------------------------
@@ -190,7 +193,10 @@ How it works:
         return isLowPriorityRoom(room);
     }
 
+    let scanCount = 0;
+
     function scanTiles() {
+        scanCount++;
         const hideLowPriority = !isVisible("low_priority");
         const names = hideLowPriority ? lowPriorityNames() : null;
 
@@ -300,12 +306,52 @@ How it works:
         }
     }
 
+    // Pre-paint, coalesced: any number of scheduleTileScan() calls within a
+    // frame collapse into a single requestAnimationFrame callback, so tiles
+    // are collapsed before the browser paints and never flash. (A debounced
+    // setTimeout instead let freshly rendered tiles paint visible first.)
     function scheduleTileScan() {
-        if (scanTimer) clearTimeout(scanTimer);
-        scanTimer = setTimeout(() => {
-            scanTimer = null;
+        if (rafHandle !== null) return;
+        rafHandle = requestAnimationFrame(() => {
+            rafHandle = null;
             scanTiles();
-        }, 200);
+        });
+    }
+
+    // The Settings switch is clicked inside a user-event task; scan right
+    // away so the new visibility applies before the next paint instead of
+    // one frame later.
+    function onSectionToggle(id, enabled) {
+        setVisible(id, enabled);
+        if (id === "latest" && !enabled && isLatestActive()) {
+            // Leaving Latest mode: restore the sectioned view.
+            setShowSections(true);
+        }
+        syncChips();
+        scanTiles();
+    }
+
+    // Room.tags fires when an m.lowpriority tag is added/removed (context
+    // menu, another device); the DOM mutation observer only sees the
+    // resulting re-render, so listen on the client directly. The client may
+    // not exist yet at start(), so this is retried from the refresh timer.
+    let tagClient = null;
+    function attachClientTagListener() {
+        if (tagClient) return;
+        const client = getClient();
+        if (!client || typeof client.on !== "function") return;
+        client.on("Room.tags", scheduleTileScan);
+        tagClient = client;
+    }
+
+    function detachClientTagListener() {
+        if (!tagClient) return;
+        try {
+            tagClient.off("Room.tags", scheduleTileScan);
+        } catch (_) {
+            /* ignore */
+        }
+        tagClient = null;
     }
 
     function observeLists() {
@@ -618,13 +664,7 @@ How it works:
         left.appendChild(desc);
 
         const sw = createSwitch(isVisible(section.id), (enabled) => {
-            setVisible(section.id, enabled);
-            if (section.id === "latest" && !enabled && isLatestActive()) {
-                // Leaving Latest mode: restore the sectioned view.
-                setShowSections(true);
-            }
-            syncChips();
-            scheduleTileScan();
+            onSectionToggle(section.id, enabled);
         });
 
         row.appendChild(left);
@@ -739,8 +779,10 @@ How it works:
         observer = new MutationObserver(onMutation);
         observer.observe(document.body, { childList: true, subtree: true });
         observeLists();
+        attachClientTagListener();
         refreshTimer = setInterval(() => {
             migrateLegacyDeviceLevel();
+            attachClientTagListener();
             observeLists();
             scanTiles();
         }, REFRESH_INTERVAL);
@@ -762,8 +804,9 @@ How it works:
         }
         if (refreshTimer) clearInterval(refreshTimer);
         refreshTimer = null;
-        if (scanTimer) clearTimeout(scanTimer);
-        scanTimer = null;
+        if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+        rafHandle = null;
+        detachClientTagListener();
         disconnectListObservers();
         if (registered) {
             window.mods.settingsTabs.unregister(TAB_ID);
@@ -792,6 +835,15 @@ How it works:
     window.mods.registerPatch(PATCH_ID, {
         start,
         stop,
-        _test: { isLowPriorityRoom },
+        _test: {
+            isLowPriorityRoom,
+            scheduleTileScan,
+            onSectionToggle,
+            attachClientTagListener,
+            getScanCount: () => scanCount,
+            resetScanCount: () => {
+                scanCount = 0;
+            },
+        },
     });
 })();
