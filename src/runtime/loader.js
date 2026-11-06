@@ -33,7 +33,13 @@ fighting over the TabbedView.
 
     function readEnabled() {
         try {
-            return new Set(JSON.parse(localStorage.getItem(ENABLED_KEY) || "[]"));
+            const raw = localStorage.getItem(ENABLED_KEY);
+            if (raw === null) {
+                // DEFAULT OFF: message-logger destabilizes the renderer under
+                // real message load (V8 recompile churn + crashes, 2026-11-06).
+                return new Set();
+            }
+            return new Set(JSON.parse(raw));
         } catch {
             return new Set();
         }
@@ -261,12 +267,13 @@ fighting over the TabbedView.
                 enabled.add(id);
                 // While paused the enabled set is the source of truth; the
                 // patch is started on unpause (or next boot), not now.
+                writeEnabled(enabled); // persist BEFORE start: a crash in start() must not lose the toggle
                 if (!paused) startPatch(id);
             } else {
                 enabled.delete(id);
                 stopPatch(id);
+                writeEnabled(enabled);
             }
-            writeEnabled(enabled);
             return true;
         },
 
