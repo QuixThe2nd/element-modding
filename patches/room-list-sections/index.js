@@ -47,6 +47,7 @@ How it works:
     const CHIP_SELECTOR = 'button[role="option"]';
     const LATEST_ATTR = "data-element-mods-latest";
     const MARKER_CLASS = "element-mods-lowprio-room";
+    const HEADER_MARKER_CLASS = "element-mods-lowprio-header";
     const STYLE_ID = "element-mods-room-list-sections-style";
     const REFRESH_INTERVAL = 5000;
     const LIST_SELECTORS = ['[data-testid="room-list"]', ".mx_LeftPanel"];
@@ -220,6 +221,71 @@ How it works:
                 else item.classList.remove(MARKER_CLASS);
             }
         }
+
+        scanHeaders(hideLowPriority);
+    }
+
+    // Hide section headers whose every room tile is low-priority-hidden, so
+    // fully-hidden sections don't leave a dangling header row behind. The
+    // virtualized list interleaves header rows and tile rows as [data-index]
+    // items, so we classify items in DOM order and decide per header.
+    function scanHeaders(hideLowPriority) {
+        if (!hideLowPriority) {
+            document.querySelectorAll("." + HEADER_MARKER_CLASS).forEach((h) => h.classList.remove(HEADER_MARKER_CLASS));
+            return;
+        }
+
+        for (const list of getLists()) {
+            let items;
+            try {
+                items = Array.from(list.querySelectorAll("[data-index]"));
+            } catch (_) {
+                continue;
+            }
+            // Classify each item in DOM order: TILE (contains a room tile) or
+            // HEADER (no tile, but a sticky/header-looking descendant with
+            // short text — headers are short labels, not arbitrary content).
+            const entries = [];
+            for (const item of items) {
+                let isHeader = false;
+                if (!item.querySelector(TILE_SELECTOR)) {
+                    const sticky = item.querySelector('[class*="stickyRow"], [class*="header"]');
+                    if (sticky && sticky.textContent.trim().length <= 40) isHeader = true;
+                }
+                entries.push({ item, isHeader, isTile: !!item.querySelector(TILE_SELECTOR) });
+            }
+
+            for (let i = 0; i < entries.length; i++) {
+                if (!entries[i].isHeader) continue;
+                const tiles = [];
+                for (let j = i + 1; j < entries.length && !entries[j].isHeader; j++) {
+                    if (entries[j].isTile) tiles.push(entries[j].item);
+                }
+                // Only hide when we saw at least one tile and ALL of them are
+                // marker-hidden. A virtualization gap (zero tiles rendered)
+                // tells us nothing, so leave the header alone.
+                const hide = tiles.length >= 1 && tiles.every((t) => t.classList.contains(MARKER_CLASS));
+                entries[i].item.classList.toggle(HEADER_MARKER_CLASS, hide);
+            }
+
+            // Sticky header rows may be rendered OUTSIDE the [data-index]
+            // items (react-virtuoso's sticky header container). We can't know
+            // which section such a row belongs to, so take the safe route:
+            // hide it only when every tile in the whole list is hidden.
+            let stickies = [];
+            try {
+                stickies = Array.from(list.querySelectorAll('[class*="stickyRow"]'));
+            } catch (_) {
+                /* ignore */
+            }
+            const allTiles = entries.filter((e) => e.isTile).map((e) => e.item);
+            const hideAll = allTiles.length >= 1 && allTiles.every((t) => t.classList.contains(MARKER_CLASS));
+            for (const sticky of stickies) {
+                if (sticky.closest("[data-index]")) continue;
+                const target = sticky.closest('[role="row"], [role="option"], div') || sticky;
+                target.classList.toggle(HEADER_MARKER_CLASS, hideAll);
+            }
+        }
     }
 
     function scheduleTileScan() {
@@ -262,11 +328,11 @@ How it works:
         if (document.getElementById(STYLE_ID)) return;
         const style = document.createElement("style");
         style.id = STYLE_ID;
-        style.textContent =
-            `.${MARKER_CLASS} {` +
+        const collapse =
             "height:1px !important;min-height:1px !important;max-height:1px !important;" +
             "overflow:hidden !important;padding:0 !important;margin:0 !important;" +
-            "border:none !important;visibility:hidden !important;}"
+            "border:none !important;visibility:hidden !important;";
+        style.textContent = `.${MARKER_CLASS} {${collapse}}.${HEADER_MARKER_CLASS} {${collapse}}`;
         document.head.appendChild(style);
     }
 
@@ -704,6 +770,9 @@ How it works:
         // Restore any low-priority room tiles we collapsed.
         for (const el of document.querySelectorAll("." + MARKER_CLASS)) {
             el.classList.remove(MARKER_CLASS);
+        }
+        for (const el of document.querySelectorAll("." + HEADER_MARKER_CLASS)) {
+            el.classList.remove(HEADER_MARKER_CLASS);
         }
         removeStyle();
     }
