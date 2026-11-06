@@ -18,7 +18,7 @@ How it works:
     setting is disabled, the room-list store returns a single "chats" section
     containing every room sorted by recency (the default sort), which is
     rendered as a flat list. So clicking "Latest" just writes that setting
-    (device level, via window.mxSettingsStore), and the app's own view model
+    (account level, via window.mxSettingsStore), and the app's own view model
     re-renders the list accordingly.
   - "Low priority" is a normal toggle. When off, the "low_priority" chip is
     hidden (Latest mode) AND every room tagged "m.lowpriority" is removed from
@@ -83,6 +83,7 @@ How it works:
     let listObservers = [];
     let refreshTimer = null;
     let scanTimer = null;
+    let migrated = false;
 
     // -- low-priority room hiding -----------------------------------------
 
@@ -358,7 +359,7 @@ How it works:
         const store = window.mxSettingsStore;
         if (!store || typeof store.setValue !== "function") return;
         try {
-            store.setValue("RoomList.showSections", null, "device", value);
+            store.setValue("RoomList.showSections", null, "account", value);
         } catch (err) {
             console.warn(`[element-mods:${PATCH_ID}] failed to set RoomList.showSections`, err);
         }
@@ -624,13 +625,44 @@ How it works:
         scheduleTileScan();
     }
 
+    // Legacy versions of this patch wrote RoomList.showSections at device
+    // level; device shadows account, so a stale device=false silently
+    // overrode whatever the user set with Element's own Settings toggle
+    // (which writes account level). Migrate to account level and drop the
+    // stale device key. One-time, best-effort: never break startup.
+    // The settings store may not be mounted yet when start() runs, so this
+    // is retried from the refresh timer until it can run once.
+    function migrateLegacyDeviceLevel() {
+        if (migrated) return;
+        const store = window.mxSettingsStore;
+        if (!store || typeof store.getValueAt !== "function") return; // retry later
+        migrated = true;
+        try {
+            if (store.getValueAt("device", "RoomList.showSections") === false) {
+                const raw = localStorage.getItem("mx_local_settings");
+                const data = raw ? JSON.parse(raw) : {};
+                if (Object.prototype.hasOwnProperty.call(data, "RoomList.showSections")) {
+                    delete data["RoomList.showSections"];
+                    localStorage.setItem("mx_local_settings", JSON.stringify(data));
+                }
+                // Keep Latest-mode users on their flat list now that the
+                // device key no longer shadows the account-level value.
+                store.setValue("RoomList.showSections", null, "account", false);
+            }
+        } catch (_) {
+            /* ignore */
+        }
+    }
+
     function start() {
         if (observer) return;
+        migrateLegacyDeviceLevel();
         injectStyle();
         observer = new MutationObserver(onMutation);
         observer.observe(document.body, { childList: true, subtree: true });
         observeLists();
         refreshTimer = setInterval(() => {
+            migrateLegacyDeviceLevel();
             observeLists();
             scanTiles();
         }, REFRESH_INTERVAL);
