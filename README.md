@@ -174,6 +174,12 @@ Right-click a message to save it, and open a 'Saved messages' page from a new bu
 </details>
 
 <details>
+<summary><b>Settings Search</b></summary>
+
+Adds a search box at the top of the Settings dialog that filters the current tab's setting subsections as you type, showing a live result count. Press **Escape** or the ✕ button to clear the query and bring everything back. Only the currently open tab is searched — the status line reminds you to try switching tabs when nothing matches.
+</details>
+
+<details>
 <summary><b>Themes</b></summary>
 
 Theme engine modeled after Vencord's theme system: apply and manage custom CSS themes (bundled, added by URL, pasted, or **generated from an uploaded image** — a color palette is extracted from the image and turned into a theme automatically.

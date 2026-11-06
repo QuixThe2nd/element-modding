@@ -1,0 +1,8 @@
+{
+  "id": "settings-search",
+  "name": "Settings Search",
+  "description": "Adds a search box at the top of the Settings dialog that filters the current tab's setting subsections as you type.",
+  "version": "1.0.0",
+  "author": "QuixThe2nd",
+  "main": "index.js"
+}
