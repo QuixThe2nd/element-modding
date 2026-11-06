@@ -20,9 +20,18 @@ How it works:
     rendered as a flat list. So clicking "Latest" just writes that setting
     (device level, via window.mxSettingsStore), and the app's own view model
     re-renders the list accordingly.
-  - "favourite" and "low_priority" chips only appear while sections are
-    disabled (Latest mode); they are always hidden since the user did not ask
-    for them.
+  - "Low priority" is a normal toggle. When off, the "low_priority" chip is
+    hidden (Latest mode) AND every room tagged "m.lowpriority" is removed from
+    the rendered room list in all modes, including the flat "Latest" view:
+    Element's chips only filter in flat mode, and with sections enabled
+    low-priority rooms sit inside Rooms/People, so room tiles themselves are
+    collapsed with a marker class (1px height, never display:none —
+    react-virtuoso warns on zero-height), re-applied by a MutationObserver
+    plus a periodic timer (same technique as the Hide Room patch). Tiles are
+    mapped to rooms by room id from the tile's React fiber when available,
+    falling back to a name->tags mapping.
+  - The "favourite" chip only appears while sections are disabled (Latest
+    mode); it is always hidden since the user did not ask for it.
   - A MutationObserver keeps the chip row in sync across React re-renders.
 */
 (() => {
@@ -37,6 +46,12 @@ How it works:
     const LISTBOX_SELECTOR = 'div[role="listbox"]';
     const CHIP_SELECTOR = 'button[role="option"]';
     const LATEST_ATTR = "data-element-mods-latest";
+    const MARKER_CLASS = "element-mods-lowprio-room";
+    const STYLE_ID = "element-mods-room-list-sections-style";
+    const REFRESH_INTERVAL = 5000;
+    const LIST_SELECTORS = ['[data-testid="room-list"]', ".mx_LeftPanel"];
+    const TILE_SELECTOR = ".mx_RoomListItemView";
+    const ROOM_NAME_SELECTOR = '[data-testid="room-name"]';
 
     // Chips Element renders (id -> label). "favourite"/"low_priority" only
     // appear when sections are disabled; they are always hidden.
@@ -47,7 +62,7 @@ How it works:
         mentions: "Mentions",
         invites: "Invites",
     };
-    const ALWAYS_HIDDEN = new Set(["favourite", "low_priority"]);
+    const ALWAYS_HIDDEN = new Set(["favourite"]);
 
     const SECTIONS = [
         { id: "unread", label: "Unreads", desc: "Rooms with unread notifications." },
@@ -55,6 +70,7 @@ How it works:
         { id: "rooms", label: "Rooms", desc: "Group rooms." },
         { id: "mentions", label: "Mentions", desc: "Rooms where you were mentioned." },
         { id: "invites", label: "Invites", desc: "Rooms you have been invited to." },
+        { id: "low_priority", label: "Low priority", desc: "Rooms marked as low priority." },
         {
             id: "latest",
             label: "Latest",
@@ -64,6 +80,199 @@ How it works:
 
     let observer = null;
     let registered = false;
+    let listObservers = [];
+    let refreshTimer = null;
+    let scanTimer = null;
+
+    // -- low-priority room hiding -----------------------------------------
+
+    function isLowPriorityRoom(room) {
+        if (!room || typeof room !== "object") return false;
+        const tags = room.tags;
+        if (!tags || typeof tags !== "object") return false;
+        return Object.prototype.hasOwnProperty.call(tags, "m.lowpriority");
+    }
+
+    function getClient() {
+        const peg = window.mxMatrixClientPeg;
+        if (!peg) return null;
+        try {
+            if (typeof peg.safeGet === "function") return peg.safeGet();
+            if (typeof peg.get === "function") return peg.get();
+        } catch (_) {
+            /* ignore */
+        }
+        return null;
+    }
+
+    // Lowercased names of every currently low-priority room (fallback mapping
+    // when the tile's fiber does not expose a room id; see the rename caveat
+    // in the Hide Room patch, which uses the same technique).
+    function lowPriorityNames() {
+        const set = new Set();
+        const client = getClient();
+        let rooms = [];
+        try {
+            rooms = (client && client.getRooms()) || [];
+        } catch (_) {
+            /* ignore */
+        }
+        for (const room of rooms) {
+            if (!isLowPriorityRoom(room)) continue;
+            let name = null;
+            try {
+                name = room.name;
+            } catch (_) {
+                /* ignore */
+            }
+            if (name == null || name === "") name = room.roomId;
+            if (name) set.add(String(name).trim().toLowerCase());
+        }
+        return set;
+    }
+
+    function roomIdFromProps(props) {
+        if (!props || typeof props !== "object") return null;
+        if (typeof props.roomId === "string" && props.roomId) return props.roomId;
+        if (props.room && typeof props.room.roomId === "string") return props.room.roomId;
+        for (const key of ["viewModel", "vm"]) {
+            const vm = props[key];
+            if (vm && typeof vm === "object") {
+                if (typeof vm.roomId === "string" && vm.roomId) return vm.roomId;
+                if (vm.props && vm.props.room && typeof vm.props.room.roomId === "string") return vm.props.room.roomId;
+                if (vm.item && typeof vm.item.roomId === "string") return vm.item.roomId;
+            }
+        }
+        if (props.item && typeof props.item.roomId === "string") return props.item.roomId;
+        return null;
+    }
+
+    function findRoomIdFromNode(node) {
+        let fiber = null;
+        for (const key in node) {
+            if (key.startsWith("__reactFiber$")) {
+                fiber = node[key];
+                break;
+            }
+        }
+        let guard = 0;
+        while (fiber && guard++ < 80) {
+            const id = roomIdFromProps(fiber.memoizedProps);
+            if (id) return id;
+            fiber = fiber.return;
+        }
+        return null;
+    }
+
+    function getLists() {
+        for (const sel of LIST_SELECTORS) {
+            try {
+                const lists = document.querySelectorAll(sel);
+                if (lists && lists.length) return lists;
+            } catch (_) {
+                /* ignore */
+            }
+        }
+        return [];
+    }
+
+    function isLowPriorityId(roomId) {
+        const client = getClient();
+        if (!client || typeof client.getRoom !== "function") return false;
+        let room = null;
+        try {
+            room = client.getRoom(roomId);
+        } catch (_) {
+            /* ignore */
+        }
+        return isLowPriorityRoom(room);
+    }
+
+    function scanTiles() {
+        const hideLowPriority = !isVisible("low_priority");
+        const names = hideLowPriority ? lowPriorityNames() : null;
+
+        for (const list of getLists()) {
+            let tiles;
+            try {
+                tiles = list.querySelectorAll(TILE_SELECTOR);
+            } catch (_) {
+                continue;
+            }
+            for (const tile of tiles) {
+                let shouldHide = false;
+                if (hideLowPriority) {
+                    const roomId = findRoomIdFromNode(tile);
+                    if (roomId) {
+                        shouldHide = isLowPriorityId(roomId);
+                    } else {
+                        const nameEl = tile.querySelector(ROOM_NAME_SELECTOR);
+                        const name = nameEl
+                            ? (nameEl.getAttribute("title") || nameEl.textContent || "").trim()
+                            : "";
+                        shouldHide = !!name && names.has(name.toLowerCase());
+                    }
+                }
+                const row = tile.closest('[role="row"], [role="option"]') || tile;
+                const item = row.closest("[data-index]") || row;
+                if (shouldHide) item.classList.add(MARKER_CLASS);
+                else item.classList.remove(MARKER_CLASS);
+            }
+        }
+    }
+
+    function scheduleTileScan() {
+        if (scanTimer) clearTimeout(scanTimer);
+        scanTimer = setTimeout(() => {
+            scanTimer = null;
+            scanTiles();
+        }, 200);
+    }
+
+    function observeLists() {
+        for (const list of getLists()) {
+            if (list.__emLowPrioObserved) continue;
+            try {
+                const obs = new MutationObserver(scheduleTileScan);
+                obs.observe(list, { childList: true, subtree: true });
+                list.__emLowPrioObserved = obs;
+                listObservers.push(obs);
+            } catch (_) {
+                /* ignore */
+            }
+        }
+    }
+
+    function disconnectListObservers() {
+        for (const obs of listObservers) {
+            try {
+                obs.disconnect();
+            } catch (_) {
+                /* ignore */
+            }
+        }
+        listObservers = [];
+        for (const list of getLists()) {
+            list.__emLowPrioObserved = null;
+        }
+    }
+
+    function injectStyle() {
+        if (document.getElementById(STYLE_ID)) return;
+        const style = document.createElement("style");
+        style.id = STYLE_ID;
+        style.textContent =
+            `.${MARKER_CLASS} {` +
+            "height:1px !important;min-height:1px !important;max-height:1px !important;" +
+            "overflow:hidden !important;padding:0 !important;margin:0 !important;" +
+            "border:none !important;visibility:hidden !important;}"
+        document.head.appendChild(style);
+    }
+
+    function removeStyle() {
+        const style = document.getElementById(STYLE_ID);
+        if (style) style.remove();
+    }
 
     // -- storage ----------------------------------------------------------
 
@@ -118,7 +327,7 @@ How it works:
                 const dash = fiber.key.lastIndexOf("-");
                 if (dash > 0) {
                     const id = fiber.key.slice(0, dash);
-                    if (id in NATIVE_FILTERS || ALWAYS_HIDDEN.has(id)) return id;
+                    if (id in NATIVE_FILTERS || ALWAYS_HIDDEN.has(id) || id === "low_priority") return id;
                 }
             }
             fiber = fiber.return;
@@ -336,6 +545,7 @@ How it works:
                 setShowSections(true);
             }
             syncChips();
+            scheduleTileScan();
         });
 
         row.appendChild(left);
@@ -411,12 +621,19 @@ How it works:
 
     function onMutation() {
         scheduleSync();
+        scheduleTileScan();
     }
 
     function start() {
         if (observer) return;
+        injectStyle();
         observer = new MutationObserver(onMutation);
         observer.observe(document.body, { childList: true, subtree: true });
+        observeLists();
+        refreshTimer = setInterval(() => {
+            observeLists();
+            scanTiles();
+        }, REFRESH_INTERVAL);
         if (!registered) {
             window.mods.settingsTabs.register(TAB_ID, {
                 label: createTabLabel(),
@@ -425,6 +642,7 @@ How it works:
             registered = true;
         }
         syncChips();
+        scanTiles();
     }
 
     function stop() {
@@ -432,6 +650,11 @@ How it works:
             observer.disconnect();
             observer = null;
         }
+        if (refreshTimer) clearInterval(refreshTimer);
+        refreshTimer = null;
+        if (scanTimer) clearTimeout(scanTimer);
+        scanTimer = null;
+        disconnectListObservers();
         if (registered) {
             window.mods.settingsTabs.unregister(TAB_ID);
             registered = false;
@@ -446,7 +669,16 @@ How it works:
                 chip.style.display = "";
             }
         }
+        // Restore any low-priority room tiles we collapsed.
+        for (const el of document.querySelectorAll("." + MARKER_CLASS)) {
+            el.classList.remove(MARKER_CLASS);
+        }
+        removeStyle();
     }
 
-    window.mods.registerPatch(PATCH_ID, { start, stop });
+    window.mods.registerPatch(PATCH_ID, {
+        start,
+        stop,
+        _test: { isLowPriorityRoom },
+    });
 })();
