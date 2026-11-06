@@ -1,7 +1,7 @@
 "use strict";
 
 (function () {
-    const PATCH_ID = "wa-dm-badges";
+    const PATCH_ID = "dm-badges";
     const LOG_PREFIX = "[element-mods] " + PATCH_ID;
 
     let origGetNotificationState = null;

@@ -1,5 +1,5 @@
 {
-  "id": "wa-dm-badges",
+  "id": "dm-badges",
   "name": "DM Badges in Spaces",
   "description": "Counts DM notification badges toward the space tile their contact belongs to (e.g. bridged WhatsApp DMs badge the WhatsApp space), in addition to People.",
   "version": "1.0.0",

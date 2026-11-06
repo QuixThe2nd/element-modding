@@ -1,11 +1,11 @@
-// Self-check for the wa-dm-badges patch.
-// Run: node patches/wa-dm-badges/test.js
+// Self-check for the dm-badges patch.
+// Run: node patches/dm-badges/test.js
 import assert from "node:assert";
 import fs from "node:fs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("./manifest.json", import.meta.url), "utf8"));
 assert.ok(manifest, "manifest.json should parse");
-assert.strictEqual(manifest.id, "wa-dm-badges", "id should match folder name");
+assert.strictEqual(manifest.id, "dm-badges", "id should match folder name");
 assert.strictEqual(manifest.author, "Quix", "author should be Quix");
 assert.ok(!manifest.required, "manifest should not have a truthy \"required\" key");
 
@@ -21,4 +21,4 @@ for (const needle of [
 }
 assert.ok(src.includes("window.mods.registerPatch"), "index.js should call window.mods.registerPatch");
 
-console.log("wa-dm-badges self-check OK");
+console.log("dm-badges self-check OK");
