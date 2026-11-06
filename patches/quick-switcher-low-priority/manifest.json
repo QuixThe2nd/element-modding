@@ -1,0 +1,8 @@
+{
+  "id": "quick-switcher-low-priority",
+  "name": "Quick Switcher Low Priority",
+  "description": "Moves rooms tagged low priority to the bottom of the Cmd+K quick switcher behind a 'Show low priority' toggle.",
+  "version": "1.0.0",
+  "author": "Quix",
+  "main": "index.js"
+}
