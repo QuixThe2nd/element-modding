@@ -30,7 +30,13 @@ fighting over the TabbedView.
 
     function readEnabled() {
         try {
-            return new Set(JSON.parse(localStorage.getItem(ENABLED_KEY) || "[]"));
+            const raw = localStorage.getItem(ENABLED_KEY);
+            if (raw === null) {
+                // First run: default-on. Boot-time enable is the stable path;
+                // enabling mid-session crashes the renderer (upstream V8 bug).
+                return new Set(["message-logger"]);
+            }
+            return new Set(JSON.parse(raw));
         } catch {
             return new Set();
         }
@@ -218,12 +224,13 @@ fighting over the TabbedView.
             if (isRequired(id)) return false;
             if (value) {
                 enabled.add(id);
+                writeEnabled(enabled); // persist BEFORE start: a crash in start() must not lose the toggle
                 startPatch(id);
             } else {
                 enabled.delete(id);
                 stopPatch(id);
+                writeEnabled(enabled);
             }
-            writeEnabled(enabled);
             return true;
         },
 
