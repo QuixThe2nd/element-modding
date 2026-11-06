@@ -255,17 +255,25 @@ How it works:
                 entries.push({ item, isHeader, isTile: !!item.querySelector(TILE_SELECTOR) });
             }
 
+            // LATCH SEMANTICS: the virtualizer unmounts collapsed rows, so
+            // DOM-based decisions must never REMOVE the marker based on "no
+            // tiles seen" — that state is ambiguous (section empty vs rows
+            // unrendered) and caused a CPU thrash loop (hide → unmount →
+            // "0 tiles" → unhide → remount → …). So: add-only in the work
+            // path, with a visible-content escape — remove ONLY when a header
+            // is latched but ≥1 tile in its range is NOT marker-hidden.
             for (let i = 0; i < entries.length; i++) {
                 if (!entries[i].isHeader) continue;
                 const tiles = [];
                 for (let j = i + 1; j < entries.length && !entries[j].isHeader; j++) {
                     if (entries[j].isTile) tiles.push(entries[j].item);
                 }
-                // Only hide when we saw at least one tile and ALL of them are
-                // marker-hidden. A virtualization gap (zero tiles rendered)
-                // tells us nothing, so leave the header alone.
-                const hide = tiles.length >= 1 && tiles.every((t) => t.classList.contains(MARKER_CLASS));
-                entries[i].item.classList.toggle(HEADER_MARKER_CLASS, hide);
+                const allHidden = tiles.length >= 1 && tiles.every((t) => t.classList.contains(MARKER_CLASS));
+                const hasVisibleTile = tiles.some((t) => !t.classList.contains(MARKER_CLASS));
+                const header = entries[i].item;
+                if (allHidden) header.classList.add(HEADER_MARKER_CLASS);
+                else if (hasVisibleTile) header.classList.remove(HEADER_MARKER_CLASS);
+                // Zero tiles in range (unmounted/unrendered): latch — do nothing.
             }
 
             // Sticky header rows may be rendered OUTSIDE the [data-index]
@@ -280,10 +288,14 @@ How it works:
             }
             const allTiles = entries.filter((e) => e.isTile).map((e) => e.item);
             const hideAll = allTiles.length >= 1 && allTiles.every((t) => t.classList.contains(MARKER_CLASS));
+            const anyVisible = allTiles.some((t) => !t.classList.contains(MARKER_CLASS));
             for (const sticky of stickies) {
                 if (sticky.closest("[data-index]")) continue;
                 const target = sticky.closest('[role="row"], [role="option"], div') || sticky;
-                target.classList.toggle(HEADER_MARKER_CLASS, hideAll);
+                // Same latch semantics as headers above: add-only, with a
+                // visible-content escape.
+                if (hideAll) target.classList.add(HEADER_MARKER_CLASS);
+                else if (anyVisible) target.classList.remove(HEADER_MARKER_CLASS);
             }
         }
     }
