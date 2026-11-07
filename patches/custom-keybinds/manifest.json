@@ -1,0 +1,8 @@
+{
+  "id": "custom-keybinds",
+  "name": "Custom Keybinds",
+  "description": "Adds configurable keyboard shortcuts to Element, including a default Cmd+H binding that goes Home instead of triggering macOS's native Hide shortcut.",
+  "version": "1.0.0",
+  "author": "Quix",
+  "main": "index.js"
+}
