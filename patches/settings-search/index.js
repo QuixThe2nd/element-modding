@@ -45,6 +45,17 @@ says so and suggests switching tabs.
         return String(text || "").toLowerCase().includes(q);
     }
 
+    function hasForeignMutation(records, root) {
+        if (!Array.isArray(records) || records.length === 0) return false;
+        if (root == null) return true;
+        return records.some((record) => record.target !== root && !root.contains(record.target));
+    }
+
+    function rightInsetFor(paddingRight) {
+        if (paddingRight !== "0px" && /^\d+(\.\d+)?px$/.test(paddingRight)) return paddingRight;
+        return "100px";
+    }
+
     // Decides which subsections to hide for a query. subsectionTexts is
     // [{ el, text }]; returns { hide: [el refs], visibleCount } so the DOM
     // layer only applies what this pure function decided.
@@ -116,6 +127,25 @@ says so and suggests switching tabs.
         return run;
     }
 
+    function createFrameScheduler(fn, raf, caf) {
+        const requestFrame = raf || window.requestAnimationFrame.bind(window);
+        const cancelFrame = caf || window.cancelAnimationFrame.bind(window);
+        let handle = null;
+        function schedule() {
+            if (handle === null) {
+                handle = requestFrame(() => {
+                    handle = null;
+                    fn();
+                });
+            }
+        }
+        schedule.cancel = () => {
+            if (handle !== null) cancelFrame(handle);
+            handle = null;
+        };
+        return schedule;
+    }
+
     // Picks the visible panel from [{ display, el }]: the first entry whose
     // display is not "none" wins (the modding-tab coordinator hides the
     // React panel via inline style when a custom tab is active); null when
@@ -137,6 +167,7 @@ says so and suggests switching tabs.
     let query = ""; // single source of truth, survives tab switches and dialog close
     const restore = createRestoreSet();
     let applyFilter = null; // debounced, created in start()
+    let scheduleApply = null; // animation-frame-coalesced, created in start()
 
     function buildStatusLine(query, plan) {
         let text = `${plan.visibleCount} result${plan.visibleCount === 1 ? "" : "s"} for '${query}'`;
@@ -170,7 +201,7 @@ says so and suggests switching tabs.
 
         const panel = dialog ? activePanel(dialog) : null;
         if (!panel || query.trim() === "") {
-            ui.status.textContent = "";
+            if (ui.status.textContent !== "") ui.status.textContent = "";
             ui.clearBtn.style.display = "none";
             return;
         }
@@ -191,7 +222,8 @@ says so and suggests switching tabs.
         }
         for (const node of sectionsToHide(sections)) restore.add(node);
 
-        ui.status.textContent = buildStatusLine(query, plan);
+        const statusText = buildStatusLine(query, plan);
+        if (ui.status.textContent !== statusText) ui.status.textContent = statusText;
         ui.clearBtn.style.display = query ? "" : "none";
     }
 
@@ -200,18 +232,18 @@ says so and suggests switching tabs.
         query = "";
         ui.input.value = "";
         applyFilter.cancel();
-        applyNow();
+        scheduleApply();
         ui.input.focus();
     }
 
     function buildUI() {
         const root = el("div");
         root.setAttribute("data-settings-search", "true");
-        root.style.cssText = "margin-bottom:8px;";
+        root.style.cssText = "margin-bottom:8px;box-sizing:border-box;min-width:0;";
 
         const row = el("div");
         row.style.cssText =
-            "display:flex;align-items:center;gap:8px;padding:8px 12px;" +
+            "box-sizing:border-box;min-width:0;display:flex;align-items:center;gap:8px;padding:8px 12px;" +
             "background:var(--cpd-color-bg-subtle-secondary,transparent);border-radius:8px;";
 
         const input = document.createElement("input");
@@ -220,7 +252,7 @@ says so and suggests switching tabs.
         input.value = query; // restore state across tab switches / reopens
         input.setAttribute("aria-label", "Search settings");
         input.style.cssText =
-            "flex:1 1 auto;padding:6px 10px;border-radius:8px;" +
+            "min-width:0;width:100%;box-sizing:border-box;flex:1 1 auto;padding:6px 10px;border-radius:8px;" +
             "border:1px solid var(--cpd-color-border-disabled,#ccc);background:transparent;" +
             "color:inherit;font:inherit;";
         input.addEventListener("input", () => {
@@ -293,7 +325,10 @@ says so and suggests switching tabs.
             panel.insertBefore(ui.root, panel.firstChild);
         }
 
-        if (query.trim() !== "") applyNow();
+        const tab = panel.querySelector(".mx_SettingsTab");
+        ui.root.style.marginRight = rightInsetFor(tab ? getComputedStyle(tab).paddingRight : "");
+
+        if (query.trim() !== "") scheduleApply();
     }
 
     function onDocumentClick(event) {
@@ -311,8 +346,11 @@ says so and suggests switching tabs.
     function start() {
         if (started) return;
         started = true;
-        applyFilter = createDebounce(applyNow, DEBOUNCE_MS);
-        observer = new MutationObserver(sync);
+        scheduleApply = createFrameScheduler(applyNow);
+        applyFilter = createDebounce(scheduleApply, DEBOUNCE_MS);
+        observer = new MutationObserver((records) => {
+            if (hasForeignMutation(records, ui ? ui.root : null)) sync();
+        });
         observer.observe(document.body, { childList: true, subtree: true });
         document.addEventListener("click", onDocumentClick, true);
         sync();
@@ -324,6 +362,8 @@ says so and suggests switching tabs.
         if (observer) observer.disconnect();
         observer = null;
         if (applyFilter) applyFilter.cancel();
+        if (scheduleApply) scheduleApply.cancel();
+        scheduleApply = null;
         document.removeEventListener("click", onDocumentClick, true);
         restore.clear();
         if (ui) {
@@ -337,10 +377,13 @@ says so and suggests switching tabs.
         stop,
         _test: {
             matchesQuery,
+            hasForeignMutation,
+            rightInsetFor,
             filterPlan,
             sectionsToHide,
             createRestoreSet,
             createDebounce,
+            createFrameScheduler,
             buildStatusLine,
             activePanelOf,
         },
