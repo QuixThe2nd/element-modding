@@ -68,7 +68,7 @@ LanguageTool-style spelling and grammar checker for the message composer. Mistak
 <details>
 <summary><b>Custom Keybinds</b></summary>
 
-Adds configurable keyboard shortcuts to Element, managed from a **Keybinds** tab in Settings. The default **Cmd+H** binding goes to Element's home view instead of triggering macOS's native **Hide Element** accelerator while Element is focused; Hide remains available from the menu. You can add, change, remove, or reset bindings for actions such as opening Settings or toggling the space panel and user menu.
+Makes Element's built-in keyboard shortcuts rebindable directly in **Settings -> Keyboard**: each shortcut row gains **Edit** (press a new key combination to record it) and **Reset** buttons, plus a **Reset all to defaults** control. Overrides apply immediately by updating Element's own shortcut table and are stored locally; no defaults are changed until you rebind something yourself. For example, you can bind **Cmd+H** to *Go to home view* — while Element is focused the keypress is consumed by the renderer, so macOS's native **Hide Element** menu accelerator never fires (Hide remains available from the menu).
 </details>
 
 <details>

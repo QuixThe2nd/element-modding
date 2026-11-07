@@ -1,20 +1,30 @@
 /*
-Patch: Custom Keybinds.
+Patch: Custom Keybinds (v2).
 
-Adds configurable keyboard shortcuts to Element. The default Cmd+H binding
-dispatches Element's home-view action and consumes the event in the renderer,
-so macOS never forwards it to the native "Hide Element" menu accelerator while
-Element is focused. Bindings are edited in a "Keybinds" Settings tab and stored
-locally.
+Makes Element's built-in keyboard shortcuts rebindable from Element's own
+Settings -> Keyboard pane: every rebindable row gains Edit (record a new key
+combination) and Reset controls, plus a Reset-all control. Overrides are
+applied by mutating the shared KEYBOARD_SHORTCUTS table's `.default` in place,
+so Element's own key handling picks them up immediately, and are persisted in
+localStorage under "element-mods.custom-keybinds" as {"overrides": {...}}.
+
+The patch changes no default shortcuts on its own and adds no Settings tab.
 */
 (() => {
     "use strict";
 
     const PATCH_ID = "custom-keybinds";
-    const TAB_ID = "custom-keybinds";
-    const PANEL_ID = `mx_tabpanel_${TAB_ID}`;
     const SETTINGS_KEY = "element-mods.custom-keybinds";
-    const DEFAULT_BINDINGS = [{ combo: "Cmd+H", action: "go_home" }];
+    const SECTION_ATTR = "data-custom-keybinds-section";
+    const ROW_ATTR = "data-custom-keybinds-row";
+    const STATUS_ATTR = "data-custom-keybinds-status";
+
+    const PANE_SELECTORS = [
+        ".mx_KeyboardUserSettingsTab",
+        ".mx_UserSettingsDialog [class*='KeyboardUserSettings']",
+        "[class*='KeyboardUserSettingsTab']",
+    ];
+
     const MODIFIER_ORDER = ["Ctrl", "Alt", "Shift", "Cmd"];
     const MODIFIER_CODES = new Set([
         "ControlLeft",
@@ -42,73 +52,81 @@ locally.
         "End",
         "PageUp",
         "PageDown",
-        "Comma",
-        "Period",
-        "Slash",
-        "Semicolon",
-        "Quote",
-        "BracketLeft",
-        "BracketRight",
-        "Backslash",
-        "Minus",
-        "Equal",
-        "Backquote",
     ]);
-    const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
-
-    const ACTIONS = {
-        go_home: {
-            label: "Go to home view",
-            dialogGuard: true,
-            run(dispatcher) {
-                if (typeof dispatcher.dispatch !== "function") return false;
-                dispatcher.dispatch({ action: "view_home_page" });
-                return true;
-            },
-        },
-        open_settings: {
-            label: "Open settings",
-            run(dispatcher) {
-                if (typeof dispatcher.dispatch !== "function") return false;
-                dispatcher.dispatch({ action: "view_user_settings" });
-                return true;
-            },
-        },
-        toggle_space_panel: {
-            label: "Toggle space panel",
-            run(dispatcher) {
-                if (typeof dispatcher.fire !== "function") return false;
-                dispatcher.fire("toggle_space_panel");
-                return true;
-            },
-        },
-        toggle_user_menu: {
-            label: "Toggle user menu",
-            run(dispatcher) {
-                if (typeof dispatcher.fire !== "function") return false;
-                dispatcher.fire("toggle_user_menu");
-                return true;
-            },
-        },
+    // Punctuation codes are stored as the characters Element sees in event.key.
+    const CODE_PUNCT_CHARS = {
+        Comma: ",",
+        Period: ".",
+        Slash: "/",
+        Semicolon: ";",
+        Quote: "'",
+        BracketLeft: "[",
+        BracketRight: "]",
+        Backslash: "\\",
+        Minus: "-",
+        Equal: "=",
+        Backquote: "`",
     };
+    const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/;
+    const KEYBINDING_FLAGS = ["ctrlKey", "altKey", "shiftKey", "metaKey", "ctrlOrCmdKey"];
+    const CHUNK_GLOBAL_NAMES = [
+        "webpackChunk",
+        "webpackChunk_web",
+        "webpackChunkwebapp",
+        "webpackChunk_element_web",
+        "webpackChunk_element",
+    ];
 
     let started = false;
-    let bindings = defaultBindings();
-    let recording = false;
-    let recorderListener = null;
-    let recorderCallback = null;
+    let overrides = {};
     let statusMessage = "";
-    let tabRegistered = false;
-    const openPanels = new Set();
+
+    let shortcutsTable = null;
+    let factoryDefaults = {};
+
+    let observer = null;
+    let paneEl = null;
+    let sectionEl = null;
+
+    let recording = false;
+    let recordingName = null;
+    let recorderListener = null;
+
+    let webpackRequire = null;
+    let chunkHooks = []; // { arr, original, wrapped }
+    let chunkWatchers = []; // { name, existing }
+    let watcherValues = {};
 
     // ------------------------------------------------------------------
-    // Pure combo and persistence helpers (exported through _test)
+    // Combo helpers
     // ------------------------------------------------------------------
 
-    function defaultBindings() {
-        return DEFAULT_BINDINGS.map((binding) => ({ ...binding }));
+    function isMac() {
+        try {
+            const nav = window.navigator || {};
+            return /mac|iphone|ipad|ipod/i.test(`${nav.platform || ""} ${nav.userAgent || ""}`);
+        } catch {
+            return false;
+        }
     }
 
+    // Display form used inside combos: letters uppercased, " " as "Space",
+    // named keys (Enter, ArrowUp, F5, ...) as-is, punctuation as the char.
+    function displayKey(key) {
+        if (key === " ") return "Space";
+        if (key.length === 1) return key.toUpperCase();
+        return key;
+    }
+
+    // Element matches shortcuts against event.key; convert a display key back.
+    function elementKey(display) {
+        if (display === "Space") return " ";
+        if (/^[A-Z]$/.test(display)) return display.toLowerCase();
+        return display;
+    }
+
+    // Derive a display key from a KeyboardEvent. Layout- and Option-safe: with
+    // Option held, event.key is a dead-key symbol ("˙"), so prefer event.code.
     function keyFromEvent(event) {
         if (!event) return null;
         const code = typeof event.code === "string" ? event.code : "";
@@ -118,9 +136,10 @@ locally.
         if (/^Key[A-Z]$/.test(code)) return code.slice(3);
         if (/^Digit[0-9]$/.test(code)) return code.slice(5);
         if (FUNCTION_KEY.test(code) || NAMED_CODES.has(code)) return code;
+        if (Object.prototype.hasOwnProperty.call(CODE_PUNCT_CHARS, code)) return CODE_PUNCT_CHARS[code];
 
         if (!key) return null;
-        return key.length === 1 ? key.toUpperCase() : key;
+        return displayKey(key);
     }
 
     function comboFromEvent(event) {
@@ -138,103 +157,451 @@ locally.
         return [...modifiers, key].join("+");
     }
 
-    function canonicalCombo(raw) {
-        if (typeof raw !== "string" || raw.length === 0) return null;
-        const parts = raw.split("+");
-        const key = parts.pop();
-        if (!key || MODIFIER_KEYS.has(key) || parts.length !== new Set(parts).size) return null;
-        if (parts.some((part) => !MODIFIER_ORDER.includes(part))) return null;
-
-        const wanted = new Set(parts);
-        const modifiers = MODIFIER_ORDER.filter((modifier) => wanted.has(modifier));
-        const bindable = modifiers.some((modifier) => modifier !== "Shift") || FUNCTION_KEY.test(key);
-        if (!bindable) return null;
-        return [...modifiers, key].join("+");
-    }
-
-    function normalizeBindings(rawBindings) {
-        const out = [];
-        const seen = new Set();
-        for (const entry of rawBindings) {
-            if (!entry || typeof entry !== "object") continue;
-            const action = entry.action;
-            if (typeof action !== "string" || !ACTIONS[action]) continue;
-            const combo = canonicalCombo(entry.combo);
-            if (!combo || seen.has(combo)) continue;
-            seen.add(combo);
-            out.push({ combo, action });
+    // "Cmd+H" -> { metaKey: true, key: "h" } (Element's IKeybinding shape).
+    function comboToKeybinding(combo) {
+        if (typeof combo !== "string" || !combo) return null;
+        const parts = combo.split("+");
+        const display = parts.pop();
+        if (!display || MODIFIER_ORDER.includes(display) || MODIFIER_KEYS.has(display)) return null;
+        if (parts.length !== new Set(parts).size || parts.some((part) => !MODIFIER_ORDER.includes(part))) {
+            return null;
         }
-        return out;
+
+        const kbd = {};
+        if (parts.includes("Ctrl")) kbd.ctrlKey = true;
+        if (parts.includes("Alt")) kbd.altKey = true;
+        if (parts.includes("Shift")) kbd.shiftKey = true;
+        if (parts.includes("Cmd")) kbd.metaKey = true;
+        kbd.key = elementKey(display);
+        return kbd;
     }
 
-    function loadBindings(storage = window.localStorage) {
+    // Inverse of comboToKeybinding; resolves ctrlOrCmdKey for this platform.
+    function keybindingToCombo(kbd) {
+        if (!kbd || typeof kbd !== "object" || typeof kbd.key !== "string" || !kbd.key) return null;
+        const mac = isMac();
+        const modifiers = [];
+        if (kbd.ctrlKey || (!mac && kbd.ctrlOrCmdKey)) modifiers.push("Ctrl");
+        if (kbd.altKey) modifiers.push("Alt");
+        if (kbd.shiftKey) modifiers.push("Shift");
+        if (kbd.metaKey || (mac && kbd.ctrlOrCmdKey)) modifiers.push("Cmd");
+        modifiers.push(displayKey(kbd.key));
+        return modifiers.join("+");
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence: {"overrides": {name: {key, ...flags}}}
+    // ------------------------------------------------------------------
+
+    function normalizeKeybinding(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+        if (typeof value.key !== "string" || value.key.length === 0) return null;
+        const kbd = { key: value.key };
+        for (const flag of KEYBINDING_FLAGS) {
+            if (value[flag] === true) kbd[flag] = true;
+        }
+        return kbd;
+    }
+
+    function loadOverrides(storage) {
         let raw = null;
         try {
-            raw = storage.getItem(SETTINGS_KEY);
+            raw = (storage || window.localStorage).getItem(SETTINGS_KEY);
         } catch {
-            return defaultBindings();
+            return {};
         }
-        if (raw == null) return defaultBindings();
+        if (raw == null) return {};
 
         let parsed;
         try {
             parsed = JSON.parse(raw);
         } catch {
-            return defaultBindings();
+            return {};
         }
-        if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.bindings)) {
-            return defaultBindings();
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+        const stored = parsed.overrides;
+        if (!stored || typeof stored !== "object" || Array.isArray(stored)) return {};
+
+        const out = {};
+        for (const [name, value] of Object.entries(stored)) {
+            const kbd = normalizeKeybinding(value);
+            if (kbd) out[name] = kbd;
         }
-        return normalizeBindings(parsed.bindings);
+        return out;
     }
 
-    function saveBindings() {
+    function saveOverrides() {
         try {
-            window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ bindings }));
+            window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ overrides }));
         } catch {
-            // Storage unavailable: keep the in-memory bindings for this session.
+            // Storage unavailable: keep the in-memory overrides for this session.
         }
     }
 
     // ------------------------------------------------------------------
-    // Key handling
+    // KEYBOARD_SHORTCUTS table: discovery, in-place mutation, restore
     // ------------------------------------------------------------------
 
-    function dialogIsOpen() {
-        try {
-            return !!document.querySelector(".mx_Dialog_wrapper");
-        } catch {
-            return false;
+    function isRebindableEntry(entry) {
+        return (
+            !!entry &&
+            typeof entry === "object" &&
+            !!entry.default &&
+            typeof entry.default === "object" &&
+            typeof entry.default.key === "string" &&
+            entry.default.key.length > 0
+        );
+    }
+
+    function looksLikeShortcutsTable(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        let count = 0;
+        for (const entry of Object.values(value)) {
+            if (isRebindableEntry(entry)) count++;
+        }
+        return count >= 3;
+    }
+
+    // Replace every property of entry.default without changing its identity:
+    // anything holding a reference to the shared table sees the new binding.
+    function mutateDefault(entry, kbd) {
+        const target = entry.default;
+        for (const key of Object.keys(target)) delete target[key];
+        Object.assign(target, kbd);
+    }
+
+    function captureFactoryDefaults(table) {
+        for (const [name, entry] of Object.entries(table)) {
+            if (isRebindableEntry(entry) && !(name in factoryDefaults)) {
+                factoryDefaults[name] = { ...entry.default };
+            }
         }
     }
 
-    function runAction(actionId) {
-        const action = ACTIONS[actionId];
-        if (!action) return false;
-        if (action.dialogGuard && dialogIsOpen()) return true;
+    function applyOverrides(table, overridesToApply) {
+        if (!looksLikeShortcutsTable(table)) return [];
+        captureFactoryDefaults(table);
+        const applied = [];
+        for (const [name, value] of Object.entries(overridesToApply || {})) {
+            const kbd = normalizeKeybinding(value);
+            if (!kbd || !factoryDefaults[name] || !table[name]) continue;
+            mutateDefault(table[name], kbd);
+            applied.push(name);
+        }
+        return applied;
+    }
 
-        const dispatcher = window.mxDispatcher;
-        if (!dispatcher) return false;
-        try {
-            return action.run(dispatcher) === true;
-        } catch {
-            return false;
+    function restoreDefaults(table) {
+        if (!table) return;
+        for (const [name, kbd] of Object.entries(factoryDefaults)) {
+            if (table[name] && table[name].default) mutateDefault(table[name], kbd);
         }
     }
 
-    function handleKeyDown(event) {
-        if (event.repeat || recording) return false;
+    function adoptTable(table) {
+        if (shortcutsTable || !looksLikeShortcutsTable(table)) return false;
+        shortcutsTable = table;
+        captureFactoryDefaults(table);
+        applyOverrides(table, overrides);
+        return true;
+    }
+
+    // -- Webpack discovery -------------------------------------------------
+    // Element does not expose KEYBOARD_SHORTCUTS globally, so grab the real
+    // __webpack_require__ by pushing a probe chunk onto the app's chunk array,
+    // then require the (few) module factories whose source mentions
+    // "ctrlOrCmdKey" and shape-check their exports.
+
+    function scanExports(exports) {
+        if (!exports || (typeof exports !== "object" && typeof exports !== "function")) return false;
+        if (looksLikeShortcutsTable(exports)) return adoptTable(exports);
+        let values;
+        try {
+            values = Object.values(exports);
+        } catch {
+            return false;
+        }
+        for (const value of values) {
+            if (looksLikeShortcutsTable(value) && adoptTable(value)) return true;
+        }
+        return false;
+    }
+
+    function scanWebpackModules() {
+        if (shortcutsTable || !webpackRequire) return;
+        const factories = webpackRequire.m;
+        if (!factories || typeof factories !== "object") return;
+        for (const id of Object.keys(factories)) {
+            let source = "";
+            try {
+                source = Function.prototype.toString.call(factories[id]);
+            } catch {
+                continue;
+            }
+            if (!source.includes("ctrlOrCmdKey")) continue;
+            let exports;
+            try {
+                exports = webpackRequire(id);
+            } catch {
+                continue;
+            }
+            try {
+                if (scanExports(exports)) return;
+            } catch {
+                // keep looking
+            }
+        }
+    }
+
+    function grabWebpackRequire(arr) {
+        if (webpackRequire) return;
+        try {
+            arr.push([
+                [Symbol("element-mods.custom-keybinds")],
+                {},
+                (require) => {
+                    webpackRequire = require;
+                },
+            ]);
+        } catch {
+            // Webpack runtime not initialised yet; the queued probe runs then.
+        }
+    }
+
+    function hookChunkArray(arr) {
+        if (!arr || typeof arr.push !== "function") return;
+        if (chunkHooks.some((hook) => hook.arr === arr)) return;
+        const original = arr.push;
+        const wrapped = function (...chunks) {
+            const result = original.apply(this, chunks);
+            if (!shortcutsTable) {
+                try {
+                    scanWebpackModules();
+                } catch {
+                    // ignore and try again on the next chunk
+                }
+            }
+            return result;
+        };
+        try {
+            arr.push = wrapped;
+        } catch {
+            return;
+        }
+        chunkHooks.push({ arr, original, wrapped });
+        grabWebpackRequire(arr);
+        if (!shortcutsTable) {
+            try {
+                scanWebpackModules();
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    function installChunkWatchers() {
+        let existing = [];
+        try {
+            existing = Object.getOwnPropertyNames(window).filter((name) => /^webpackChunk/.test(name));
+        } catch {
+            // ignore
+        }
+        const names = new Set([...CHUNK_GLOBAL_NAMES, ...existing]);
+        for (const name of names) {
+            let current;
+            try {
+                current = window[name];
+            } catch {
+                continue;
+            }
+            if (Array.isArray(current)) {
+                hookChunkArray(current);
+                continue;
+            }
+            if (current !== undefined) continue;
+            const descriptor = Object.getOwnPropertyDescriptor(window, name);
+            if (descriptor && descriptor.configurable === false) continue;
+            try {
+                Object.defineProperty(window, name, {
+                    configurable: true,
+                    enumerable: false,
+                    get() {
+                        return watcherValues[name];
+                    },
+                    set(value) {
+                        watcherValues[name] = value;
+                        if (Array.isArray(value)) hookChunkArray(value);
+                    },
+                });
+                chunkWatchers.push({ name, existing: descriptor });
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    function stopWebpackDiscovery() {
+        for (const { arr, original, wrapped } of chunkHooks) {
+            try {
+                if (arr.push === wrapped) arr.push = original;
+            } catch {
+                // ignore
+            }
+        }
+        chunkHooks = [];
+        for (const { name, existing } of chunkWatchers) {
+            try {
+                if (existing) {
+                    Object.defineProperty(window, name, existing);
+                } else {
+                    const value = watcherValues[name];
+                    delete window[name];
+                    if (value !== undefined) {
+                        Object.defineProperty(window, name, {
+                            configurable: true,
+                            enumerable: true,
+                            writable: true,
+                            value,
+                        });
+                    }
+                }
+            } catch {
+                // ignore
+            }
+        }
+        chunkWatchers = [];
+        watcherValues = {};
+    }
+
+    function tryResolveTable() {
+        if (shortcutsTable) return true;
+        for (const candidate of [window.mxKeyboardShortcuts, window.KEYBOARD_SHORTCUTS]) {
+            if (adoptTable(candidate)) break;
+        }
+        if (!shortcutsTable) {
+            try {
+                scanWebpackModules();
+            } catch {
+                // ignore
+            }
+        }
+        return !!shortcutsTable;
+    }
+
+    // ------------------------------------------------------------------
+    // Override actions
+    // ------------------------------------------------------------------
+
+    function labelFor(name) {
+        const entry = shortcutsTable && shortcutsTable[name];
+        return entry && entry.displayName != null ? String(entry.displayName) : name;
+    }
+
+    function findConflict(combo, exceptName) {
+        if (!shortcutsTable) return null;
+        for (const [name, entry] of Object.entries(shortcutsTable)) {
+            if (name === exceptName || !isRebindableEntry(entry)) continue;
+            if (keybindingToCombo(entry.default) === combo) return labelFor(name);
+        }
+        return null;
+    }
+
+    function setOverride(name, combo) {
+        const kbd = comboToKeybinding(combo);
+        if (!kbd || !factoryDefaults[name]) return false;
+        overrides[name] = kbd;
+        saveOverrides();
+        if (shortcutsTable && shortcutsTable[name]) mutateDefault(shortcutsTable[name], kbd);
+        statusMessage = `Saved ${combo} for ${labelFor(name)}.`;
+        refreshSection();
+        return true;
+    }
+
+    function resetOverride(name) {
+        if (!(name in overrides)) return false;
+        delete overrides[name];
+        saveOverrides();
+        if (shortcutsTable && shortcutsTable[name] && factoryDefaults[name]) {
+            mutateDefault(shortcutsTable[name], factoryDefaults[name]);
+        }
+        const factory = keybindingToCombo(factoryDefaults[name]);
+        statusMessage = `${labelFor(name)} reset to ${factory || "Element's default"}.`;
+        refreshSection();
+        return true;
+    }
+
+    function resetAll() {
+        const had = Object.keys(overrides).length > 0;
+        overrides = {};
+        saveOverrides();
+        restoreDefaults(shortcutsTable);
+        statusMessage = had ? "All keybinds reset to Element's defaults." : "No custom keybinds to reset.";
+        refreshSection();
+        return had;
+    }
+
+    // ------------------------------------------------------------------
+    // Recorder
+    // ------------------------------------------------------------------
+
+    function cancelRecorder(message) {
+        if (recorderListener) {
+            try {
+                window.removeEventListener("keydown", recorderListener, true);
+            } catch {
+                // ignore
+            }
+        }
+        recorderListener = null;
+        recordingName = null;
+        recording = false;
+        if (message != null) statusMessage = message;
+    }
+
+    function onRecorderKeyDown(event) {
+        if (event.repeat) return;
+        if (typeof event.preventDefault === "function") event.preventDefault();
+        if (typeof event.stopPropagation === "function") event.stopPropagation();
+
+        if (event.key === "Escape" || event.code === "Escape") {
+            cancelRecorder("Recording cancelled.");
+            refreshSection();
+            return;
+        }
+
         const combo = comboFromEvent(event);
-        if (!combo) return false;
-        const binding = bindings.find((entry) => entry.combo === combo);
-        if (!binding || !runAction(binding.action)) return false;
-        event.preventDefault();
-        event.stopPropagation();
+        if (!combo) {
+            statusMessage = "Press a valid shortcut: Ctrl, Alt or Cmd plus a key, or a function key.";
+            refreshSection();
+            return;
+        }
+
+        const conflict = findConflict(combo, recordingName);
+        if (conflict) {
+            cancelRecorder(`${combo} is already assigned to ${conflict}.`);
+            refreshSection();
+            return;
+        }
+
+        const name = recordingName;
+        cancelRecorder();
+        setOverride(name, combo);
+    }
+
+    function beginRecording(name) {
+        if (!started || !factoryDefaults[name]) return false;
+        cancelRecorder();
+        recording = true;
+        recordingName = name;
+        recorderListener = onRecorderKeyDown;
+        statusMessage = `Press the new shortcut for ${labelFor(name)}. Escape cancels.`;
+        window.addEventListener("keydown", recorderListener, true);
+        refreshSection();
         return true;
     }
 
     // ------------------------------------------------------------------
-    // Settings tab
+    // Keyboard pane augmentation
     // ------------------------------------------------------------------
 
     function h(tag, className, text) {
@@ -260,213 +627,106 @@ locally.
         return button;
     }
 
-    function setRecording(value) {
-        recording = !!value;
-    }
+    function buildRow(name) {
+        const entry = shortcutsTable[name];
+        const overridden = name in overrides;
+        const isRecordingRow = recording && recordingName === name;
 
-    function cancelRecorder(message) {
-        if (recorderListener) window.removeEventListener("keydown", recorderListener, true);
-        recorderListener = null;
-        recorderCallback = null;
-        recording = false;
-        if (message != null) statusMessage = message;
-    }
-
-    function onRecorderKeyDown(event) {
-        event.preventDefault();
-        event.stopPropagation();
-
-        if (event.key === "Escape" || event.code === "Escape") {
-            cancelRecorder("Recording cancelled.");
-            refreshPanels();
-            return;
-        }
-
-        const combo = comboFromEvent(event);
-        if (!combo) {
-            statusMessage = "Press a valid shortcut: Ctrl, Alt or Cmd plus a key, or a function key.";
-            refreshPanels();
-            return;
-        }
-
-        const callback = recorderCallback;
-        cancelRecorder("");
-        const error = callback ? callback(combo) : "";
-        statusMessage = error || `Saved ${combo}.`;
-        refreshPanels();
-    }
-
-    function beginRecording(callback) {
-        cancelRecorder();
-        recorderCallback = callback;
-        recorderListener = onRecorderKeyDown;
-        recording = true;
-        statusMessage = "Press the new shortcut. Escape cancels.";
-        window.addEventListener("keydown", recorderListener, true);
-        refreshPanels();
-    }
-
-    function comboInUse(combo, exceptIndex = -1) {
-        return bindings.some((binding, index) => index !== exceptIndex && binding.combo === combo);
-    }
-
-    function updateBindings(nextBindings, message) {
-        bindings = nextBindings;
-        saveBindings();
-        statusMessage = message;
-        refreshPanels();
-    }
-
-    function createTabLabel() {
-        const li = h("li", "mx_TabbedView_tabLabel");
-        li.setAttribute("role", "tab");
-        li.setAttribute("tabindex", "0");
-        li.setAttribute("aria-controls", PANEL_ID);
-        li.setAttribute("aria-selected", "false");
-        li.setAttribute("data-testid", `settings-tab-${TAB_ID}`);
-
-        const icon = h("span");
-        icon.setAttribute("aria-hidden", "true");
-        icon.style.cssText = "display:inline-flex;margin-inline-end:8px;color:var(--cpd-color-icon-primary,inherit);";
-        icon.innerHTML =
-            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01"/><path d="M11 10h.01"/><path d="M15 10h.01"/><path d="M7 14h10"/></svg>';
-        li.appendChild(icon);
-        li.appendChild(h("span", "mx_TabbedView_tabLabel_text", "Keybinds"));
-        return li;
-    }
-
-    function createBindingRow(binding, index) {
         const row = h("div");
+        row.setAttribute(ROW_ATTR, name);
         row.style.cssText =
-            "display:grid;grid-template-columns:minmax(110px,auto) 1fr auto auto;gap:8px;align-items:center;" +
-            "padding:8px 10px;background:var(--cpd-color-bg-subtle-secondary,transparent);border-radius:8px;margin-bottom:6px;";
+            "display:grid;grid-template-columns:1fr auto auto auto;gap:8px;align-items:center;" +
+            "padding:6px 0;border-bottom:1px solid var(--cpd-color-border-disabled,#333);";
 
-        const combo = h("code", null, binding.combo);
+        row.appendChild(h("span", null, labelFor(name)));
+
+        const combo = h("code", null, keybindingToCombo(entry.default) || "—");
         combo.style.cssText =
-            "padding:2px 6px;border-radius:4px;background:var(--cpd-color-bg-canvas-default,#fff);" +
-            "border:1px solid var(--cpd-color-border-disabled,#ddd);font-family:monospace;";
+            "padding:2px 6px;border-radius:4px;font-family:monospace;" +
+            (overridden
+                ? "background:var(--cpd-color-bg-accent-rest,rgba(11,189,139,0.15));" +
+                  "color:var(--cpd-color-text-accent-rest,inherit);"
+                : "background:var(--cpd-color-bg-subtle-secondary,transparent);");
         row.appendChild(combo);
 
-        const select = h("select");
-        select.style.cssText =
-            "min-width:0;padding:5px 8px;border-radius:6px;border:1px solid var(--cpd-color-border-disabled,#ccc);" +
-            "background:transparent;color:inherit;font:inherit;";
-        for (const [actionId, action] of Object.entries(ACTIONS)) {
-            const option = h("option", null, action.label);
-            option.value = actionId;
-            select.appendChild(option);
-        }
-        select.value = binding.action;
-        select.addEventListener("change", () => {
-            const next = bindings.map((entry, entryIndex) =>
-                entryIndex === index ? { ...entry, action: select.value } : entry,
-            );
-            updateBindings(next, "Keybind updated.");
-        });
-        row.appendChild(select);
-
-        row.appendChild(
-            makeButton("Change", () => {
-                beginRecording((combo) => {
-                    if (comboInUse(combo, index)) return `${combo} is already assigned.`;
-                    const next = bindings.map((entry, entryIndex) =>
-                        entryIndex === index ? { ...entry, combo } : entry,
-                    );
-                    bindings = next;
-                    saveBindings();
-                    return "";
-                });
-            }),
-        );
-        row.appendChild(
-            makeButton("Remove", () => {
-                updateBindings(
-                    bindings.filter((_, entryIndex) => entryIndex !== index),
-                    `${binding.combo} removed.`,
-                );
-            }),
-        );
+        row.appendChild(makeButton(isRecordingRow ? "Press keys…" : "Edit", () => beginRecording(name), isRecordingRow));
+        if (overridden) row.appendChild(makeButton("Reset", () => resetOverride(name)));
         return row;
     }
 
-    function createPanelContent() {
-        const content = h("div");
-        content.style.cssText = "padding:24px;max-width:720px;";
+    function buildSection() {
+        const section = h("div");
+        section.setAttribute(SECTION_ATTR, PATCH_ID);
+        section.style.cssText =
+            "margin-top:24px;padding-top:16px;border-top:1px solid var(--cpd-color-border-disabled,#333);";
 
-        const title = h("h3", null, "Keybinds");
-        title.style.cssText = "margin:0 0 4px;font:var(--cpd-font-heading-md-semibold,600 16px/1.4 sans-serif);";
-        content.appendChild(title);
+        const title = h("h4", null, "Custom keybinds");
+        title.style.cssText = "margin:0 0 4px;font:var(--cpd-font-heading-sm-semibold,600 14px/1.4 sans-serif);";
+        section.appendChild(title);
 
         const explanation = h(
             "div",
             null,
-            "Cmd+H normally hides Element. Binding it here replaces that shortcut while Element is focused; Hide remains available from the menu. Add, change, or remove shortcuts below.",
+            "Rebind Element's shortcuts: click Edit and press the new key combination. Changes apply " +
+                "immediately and are stored locally. Reset restores Element's default for that shortcut.",
         );
-        explanation.style.cssText = "color:var(--cpd-color-text-secondary,inherit);margin-bottom:16px;";
-        content.appendChild(explanation);
+        explanation.style.cssText = "color:var(--cpd-color-text-secondary,inherit);margin-bottom:12px;";
+        section.appendChild(explanation);
 
         if (statusMessage) {
             const status = h("div", null, statusMessage);
+            status.setAttribute(STATUS_ATTR, "true");
             status.style.cssText = "margin-bottom:12px;color:var(--cpd-color-text-secondary,inherit);";
-            content.appendChild(status);
+            section.appendChild(status);
         }
 
-        if (bindings.length === 0) {
-            const empty = h("div", null, "No keybinds configured.");
-            empty.style.marginBottom = "12px";
-            content.appendChild(empty);
-        } else {
-            bindings.forEach((binding, index) => content.appendChild(createBindingRow(binding, index)));
+        for (const [name, entry] of Object.entries(shortcutsTable)) {
+            if (isRebindableEntry(entry)) section.appendChild(buildRow(name));
         }
 
         const controls = h("div");
         controls.style.cssText = "display:flex;gap:8px;margin-top:12px;";
-        controls.appendChild(
-            makeButton(
-                "Add keybind",
-                () => {
-                    beginRecording((combo) => {
-                        if (comboInUse(combo)) return `${combo} is already assigned.`;
-                        bindings = [...bindings, { combo, action: "go_home" }];
-                        saveBindings();
-                        return "";
-                    });
-                },
-                true,
-            ),
-        );
-        controls.appendChild(
-            makeButton("Reset to defaults", () => {
-                updateBindings(defaultBindings(), "Keybinds reset to defaults.");
-            }),
-        );
-        content.appendChild(controls);
-        return content;
+        controls.appendChild(makeButton("Reset all to defaults", () => resetAll()));
+        section.appendChild(controls);
+        return section;
     }
 
-    function createPanel() {
-        const panel = h("div", "mx_TabbedView_tabPanel");
-        panel.id = PANEL_ID;
-        panel.setAttribute("role", "tabpanel");
-        panel.setAttribute("aria-labelledby", `${PANEL_ID}_label`);
-        panel.setAttribute("data-custom-keybinds-panel", "true");
-
-        const scroller = h("div", "mx_AutoHideScrollbar mx_TabbedView_tabPanelContent");
-        scroller.appendChild(createPanelContent());
-        openPanels.add(scroller);
-        panel.appendChild(scroller);
-        return panel;
-    }
-
-    function refreshPanels() {
-        for (const scroller of openPanels) {
-            if (!scroller.isConnected) {
-                openPanels.delete(scroller);
-                continue;
+    function findKeyboardPane() {
+        for (const selector of PANE_SELECTORS) {
+            try {
+                const el = document.querySelector(selector);
+                if (el) return el;
+            } catch {
+                // ignore
             }
-            scroller.textContent = "";
-            scroller.appendChild(createPanelContent());
         }
+        return null;
+    }
+
+    function sync() {
+        if (!started) return;
+        if (!shortcutsTable) tryResolveTable();
+        paneEl = findKeyboardPane();
+        if (!paneEl || !shortcutsTable) return;
+        if (!sectionEl || !sectionEl.isConnected) {
+            sectionEl = buildSection();
+            paneEl.appendChild(sectionEl);
+        }
+    }
+
+    function refreshSection() {
+        if (!paneEl || !sectionEl || !sectionEl.isConnected || !shortcutsTable) return;
+        const next = buildSection();
+        sectionEl.remove();
+        paneEl.appendChild(next);
+        sectionEl = next;
+    }
+
+    function startObserver() {
+        const ObserverCtor = window.MutationObserver;
+        if (typeof ObserverCtor !== "function" || !document.body) return;
+        observer = new ObserverCtor(() => sync());
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     // ------------------------------------------------------------------
@@ -476,22 +736,31 @@ locally.
     function start() {
         if (started) return;
         started = true;
-        bindings = loadBindings();
-        window.addEventListener("keydown", handleKeyDown, true);
-        if (window.mods && window.mods.settingsTabs) {
-            window.mods.settingsTabs.register(TAB_ID, { label: createTabLabel(), renderPanel: createPanel });
-            tabRegistered = true;
-        }
+        overrides = loadOverrides();
+        tryResolveTable();
+        installChunkWatchers();
+        startObserver();
+        sync();
     }
 
     function stop() {
         if (!started) return;
         started = false;
         cancelRecorder();
-        window.removeEventListener("keydown", handleKeyDown, true);
-        if (tabRegistered && window.mods.settingsTabs) window.mods.settingsTabs.unregister(TAB_ID);
-        tabRegistered = false;
-        openPanels.clear();
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        if (sectionEl) {
+            sectionEl.remove();
+            sectionEl = null;
+        }
+        paneEl = null;
+        restoreDefaults(shortcutsTable);
+        stopWebpackDiscovery();
+        shortcutsTable = null;
+        factoryDefaults = {};
+        webpackRequire = null;
         statusMessage = "";
     }
 
@@ -500,10 +769,23 @@ locally.
         stop,
         _test: {
             comboFromEvent,
-            canonicalCombo,
-            loadBindings,
-            handleKeyDown,
-            setRecording,
+            comboToKeybinding,
+            keybindingToCombo,
+            loadOverrides,
+            applyOverrides,
+            restoreDefaults,
+            isRebindableEntry,
+            looksLikeShortcutsTable,
+            beginRecording,
+            cancelRecording: () => cancelRecorder(),
+            isRecording: () => recording,
+            getStatus: () => statusMessage,
+            getOverrides: () => JSON.parse(JSON.stringify(overrides)),
+            setOverride,
+            resetOverride,
+            resetAll,
+            sync,
+            findKeyboardPane,
         },
     });
 })();
