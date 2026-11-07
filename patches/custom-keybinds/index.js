@@ -20,8 +20,8 @@ The patch changes no default shortcuts on its own and adds no Settings tab.
     const STATUS_ATTR = "data-custom-keybinds-status";
 
     const PANE_SELECTORS = [
-        ".mx_KeyboardUserSettingsTab",
-        ".mx_UserSettingsDialog [class*='KeyboardUserSettings']",
+        "#mx_tabpanel_USER_KEYBOARD_TAB",
+        ".mx_TabbedView_tabPanel:has(.mx_KeyboardShortcut_shortcutList)",
         "[class*='KeyboardUserSettingsTab']",
     ];
 
