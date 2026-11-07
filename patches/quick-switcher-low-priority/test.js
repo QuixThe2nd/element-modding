@@ -130,4 +130,78 @@ assert.strictEqual(plan.collapsed, true);
 plan = t.planSections([], false);
 assert.strictEqual(plan.toggleOnSectionId, null, "no sections -> no toggle");
 
+// -- pickVisibleTarget ----------------------------------------------------
+assert.strictEqual(typeof t.pickVisibleTarget, "function", "_test.pickVisibleTarget");
+const hidden = { offsetParent: null };
+const firstVisible = { offsetParent: {} };
+const secondVisible = { offsetParent: {} };
+assert.strictEqual(t.pickVisibleTarget([hidden, firstVisible], firstVisible), null, "visible active row needs no redirect");
+assert.strictEqual(t.pickVisibleTarget([hidden, firstVisible], null), null, "missing active row needs no redirect");
+assert.strictEqual(
+    t.pickVisibleTarget([hidden, firstVisible, secondVisible], hidden),
+    firstVisible,
+    "hidden active row redirects to the first visible node in DOM order",
+);
+assert.strictEqual(t.pickVisibleTarget([hidden, { offsetParent: null }], hidden), null, "no visible target");
+
+// -- findRovingContext ----------------------------------------------------
+assert.strictEqual(typeof t.findRovingContext, "function", "_test.findRovingContext");
+const contextValue = { state: { nodes: [] }, dispatch() {} };
+const nodeWithContext = {
+    __reactFiber$abc: {
+        return: {
+            memoizedProps: { value: contextValue },
+        },
+    },
+};
+assert.strictEqual(t.findRovingContext(nodeWithContext), contextValue, "finds the roving provider up the fiber chain");
+assert.strictEqual(
+    t.findRovingContext({ __reactFiber$abc: { return: { memoizedProps: { value: {} } } } }),
+    null,
+    "ignores a chain without a roving provider",
+);
+assert.strictEqual(t.findRovingContext({}), null, "node without a fiber");
+
+// -- fixActiveRow ---------------------------------------------------------
+assert.strictEqual(typeof t.fixActiveRow, "function", "_test.fixActiveRow");
+const dispatches = [];
+const scrolls = [];
+const rovingContext = {
+    state: { nodes: [] },
+    dispatch(action) {
+        dispatches.push(action);
+    },
+};
+const makeOption = (id, offsetParent) => ({
+    id,
+    offsetParent,
+    __reactFiber$test: { memoizedProps: { value: rovingContext } },
+    scrollIntoView(options) {
+        scrolls.push({ node: this, options });
+    },
+});
+const hiddenActive = makeOption("hidden-active", null);
+const visibleTarget = makeOption("visible-target", {});
+rovingContext.state.nodes = [hiddenActive, visibleTarget];
+let activeId = hiddenActive.id;
+sandbox.document.querySelector = (selector) => (
+    selector === ".mx_SpotlightDialog input[type=text]"
+        ? { getAttribute: (name) => (name === "aria-activedescendant" ? activeId : null) }
+        : null
+);
+sandbox.document.getElementById = (id) => rovingContext.state.nodes.find((node) => node.id === id) || null;
+
+t.fixActiveRow();
+assert.strictEqual(dispatches.length, 1, "hidden active row causes exactly one SET_FOCUS dispatch");
+assert.strictEqual(dispatches[0].type, "SET_FOCUS");
+assert.strictEqual(dispatches[0].payload.node, visibleTarget, "redirects to the first visible row");
+assert.strictEqual(scrolls.length, 1, "scrolls the visible target into view");
+assert.strictEqual(scrolls[0].node, visibleTarget);
+assert.deepStrictEqual({ ...scrolls[0].options }, { block: "nearest" });
+
+activeId = visibleTarget.id;
+t.fixActiveRow();
+assert.strictEqual(dispatches.length, 1, "visible active row causes no additional dispatch");
+assert.strictEqual(scrolls.length, 1, "visible active row causes no additional scrolling");
+
 console.log("quick-switcher-low-priority self-check OK");

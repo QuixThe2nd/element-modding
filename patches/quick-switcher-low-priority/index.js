@@ -16,9 +16,10 @@ How it works:
     its DOM id (mx_SpotlightDialog_button_result_<roomId>, sliced — never
     split — because room ids contain "_" and ":"), falling back to the
     React fiber walk used by the room-list-sections patch.
-  - Low-priority options are hidden with display:none only: Element's own
-    roving-tabindex navigation skips nodes with offsetParent === null, so
-    arrow-key order and Enter keep working, and React keeps owning the DOM.
+  - Low-priority options are hidden with display:none only, so React keeps
+    owning the DOM. Arrow-key navigation already skips hidden nodes; an
+    aria-activedescendant observer additionally redirects Element's active
+    row when its result-reset timer selects a hidden option.
   - One toggle row is injected after the first marked section's option
     list, labelled "Show low priority (N)" / "Hide low priority (N)";
     the expanded/collapsed state is persisted in localStorage
@@ -34,6 +35,7 @@ How it works:
     const STYLE_ID = "element-mods-qs-lp-style";
 
     const DIALOG_SELECTOR = ".mx_SpotlightDialog";
+    const INPUT_SELECTOR = ".mx_SpotlightDialog input[type=text]";
     const RESULTS_SECTION_SELECTOR = ".mx_SpotlightDialog_section.mx_SpotlightDialog_results";
     const OPTION_SELECTOR = '[role="option"]';
     const RESULT_ID_PREFIX = "mx_SpotlightDialog_button_result_";
@@ -43,6 +45,8 @@ How it works:
     const REFRESH_INTERVAL = 250;
 
     let refreshTimer = null;
+    let activeRowObserver = null;
+    let observedInput = null;
 
     // -- pure helpers (exported via _test) ---------------------------------
 
@@ -86,6 +90,14 @@ How it works:
             }
         }
         return { collapsed: !expanded, toggleOnSectionId };
+    }
+
+    function pickVisibleTarget(nodes, activeNode) {
+        if (!activeNode || activeNode.offsetParent !== null) return null;
+        for (const node of nodes || []) {
+            if (node.offsetParent !== null) return node;
+        }
+        return null;
     }
 
     // -- client access ------------------------------------------------------
@@ -137,6 +149,32 @@ How it works:
         return null;
     }
 
+    function findRovingContext(node) {
+        if (!node) return null;
+        let fiber = null;
+        for (const key in node) {
+            if (key.startsWith("__reactFiber$")) {
+                fiber = node[key];
+                break;
+            }
+        }
+        let guard = 0;
+        while (fiber && guard++ < 80) {
+            const props = fiber.memoizedProps;
+            const value = props && props.value;
+            if (
+                value &&
+                typeof value.dispatch === "function" &&
+                value.state &&
+                Array.isArray(value.state.nodes)
+            ) {
+                return value;
+            }
+            fiber = fiber.return;
+        }
+        return null;
+    }
+
     function findRoomIdFromNode(node) {
         let fiber = null;
         for (const key in node) {
@@ -161,6 +199,44 @@ How it works:
             if (roomId) return roomId;
         }
         return findRoomIdFromNode(node);
+    }
+
+    function fixActiveRow() {
+        const input = document.querySelector(INPUT_SELECTOR);
+        if (!input) return;
+        const activeId = input.getAttribute("aria-activedescendant");
+        if (!activeId) return;
+        const activeNode = document.getElementById(activeId);
+        if (!activeNode) return;
+
+        let context = findRovingContext(activeNode);
+        if (!context) {
+            for (const option of document.querySelectorAll(`${DIALOG_SELECTOR} ${OPTION_SELECTOR}`)) {
+                if (option === activeNode) continue;
+                context = findRovingContext(option);
+                if (context) break;
+            }
+        }
+        if (!context) return;
+
+        const target = pickVisibleTarget(context.state.nodes, activeNode);
+        if (!target) return;
+        context.dispatch({ type: "SET_FOCUS", payload: { node: target } });
+        target.scrollIntoView?.({ block: "nearest" });
+    }
+
+    function observeActiveRow() {
+        const input = document.querySelector(INPUT_SELECTOR);
+        if (input === observedInput) return;
+        if (activeRowObserver) activeRowObserver.disconnect();
+        activeRowObserver = null;
+        observedInput = input;
+        if (!input) return;
+        activeRowObserver = new MutationObserver(() => fixActiveRow());
+        activeRowObserver.observe(input, {
+            attributes: true,
+            attributeFilter: ["aria-activedescendant"],
+        });
     }
 
     // -- expanded/collapsed state -------------------------------------------
@@ -230,8 +306,10 @@ How it works:
         button.tabIndex = -1; // stay out of roving tabindex; mouse only
         setToggleLabel(button, count);
         button.addEventListener("click", () => {
-            writeExpanded(!readExpanded());
+            const expanded = !readExpanded();
+            writeExpanded(expanded);
             apply();
+            if (!expanded) fixActiveRow();
         });
         row.appendChild(button);
         return row;
@@ -245,6 +323,7 @@ How it works:
     // -- main pass -----------------------------------------------------------
 
     function apply() {
+        observeActiveRow();
         if (!document.querySelector(DIALOG_SELECTOR)) {
             // Dialog closed: zero DOM footprint (the dialog's subtree dies on
             // its own); just drop our style element if it lingers.
@@ -288,6 +367,7 @@ How it works:
         if (markedCount === 0) {
             // Nothing low-priority among the results: zero footprint.
             removeStyle();
+            fixActiveRow();
             return;
         }
 
@@ -306,6 +386,7 @@ How it works:
         } else {
             setToggleLabel(row.querySelector("button"), markedCount);
         }
+        fixActiveRow();
     }
 
     // -- lifecycle -----------------------------------------------------------
@@ -319,6 +400,9 @@ How it works:
     function stop() {
         if (refreshTimer) clearInterval(refreshTimer);
         refreshTimer = null;
+        if (activeRowObserver) activeRowObserver.disconnect();
+        activeRowObserver = null;
+        observedInput = null;
         removeStyle();
         for (const section of document.querySelectorAll(`[${SECTION_ATTR}]`)) {
             section.removeAttribute(SECTION_ATTR);
@@ -337,6 +421,9 @@ How it works:
             roomIdFromOptionId,
             partitionOptionIds,
             planSections,
+            pickVisibleTarget,
+            findRovingContext,
+            fixActiveRow,
         },
     });
 })();
