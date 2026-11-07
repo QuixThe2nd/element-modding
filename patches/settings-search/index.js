@@ -260,6 +260,11 @@ says so and suggests switching tabs.
             applyFilter();
         });
         input.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") {
+                query = input.value;
+                applyFilter.cancel();
+                scheduleApply();
+            }
             if (event.key === "Escape") {
                 event.stopPropagation();
                 clearQuery();

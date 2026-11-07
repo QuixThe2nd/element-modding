@@ -437,7 +437,30 @@ assert.ok(zero.includes("try switching tabs"), "zero-match status hints at tab s
     assert.strictEqual(applyCount, 1, "the query is applied once without an observer loop");
     assert.strictEqual(frames.size, 0, "no animation frame remains pending");
     assert.strictEqual(mutationRecords.length, 0, "the observer mutation chain stops");
-    assert.ok(root.querySelector('[aria-live="polite"]').textContent.startsWith("1 result for 'display'"));
+    const status = root.querySelector('[aria-live="polite"]');
+    assert.ok(status.textContent.startsWith("1 result for 'display'"));
+
+    // Enter applies the current input value even if no input event fired.
+    input.value = "email";
+    input.dispatch("keydown", { key: "Enter" });
+    flushFrames();
+    assert.ok(
+        status.textContent.startsWith("1 result for 'email'"),
+        "Enter applies the filter without an input event or a debounce timer flush",
+    );
+
+    // Enter cancels typing's pending debounce, so flushing timers cannot apply twice.
+    const applyCountBeforeEnter = applyCount;
+    input.value = "name";
+    input.dispatch("input");
+    assert.strictEqual(timers.size, 1, "typing still schedules a debounce timer");
+    input.dispatch("keydown", { key: "Enter" });
+    flushFrames();
+    assert.strictEqual(applyCount, applyCountBeforeEnter + 1, "Enter applies once immediately");
+    flushTimers();
+    flushFrames();
+    assert.strictEqual(applyCount, applyCountBeforeEnter + 1, "the cancelled debounce does not apply again");
+    assert.ok(status.textContent.startsWith("1 result for 'name'"));
 
     input.value = "name";
     input.dispatch("input");
@@ -450,7 +473,7 @@ assert.ok(zero.includes("try switching tabs"), "zero-match status hints at tab s
 // --- manifest ---
 const manifest = JSON.parse(fs.readFileSync(new URL("./manifest.json", import.meta.url), "utf8"));
 assert.strictEqual(manifest.id, "settings-search", "manifest id matches folder");
-assert.strictEqual(manifest.version, "1.0.1");
+assert.strictEqual(manifest.version, "1.0.2");
 assert.strictEqual(manifest.author, "QuixThe2nd");
 assert.strictEqual(manifest.main, "index.js");
 
